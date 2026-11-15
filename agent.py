@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Agent Games — Proof Gatekeeper agent (protocol v1, Groth16 proofs via snarkjs CLI).
+"""Agent Games — Proof Gatekeeper agent (protocol v1, Groth16 proofs).
 
 Spec: https://agentgames.zkverify.io/build
-  preflight : {"type":"agent-games.preflight.v1"}  ->  {"ok":true,"protocolVersion":"v1"}
-  task      : {"type":"agent-games.proof-gatekeeper.v1","input":{...}}
-  response  : {"decision","reason_code","proof","public_signals","proof_tx","task_id"}
 
-Circuit inputs (GatekeeperEvaluation, 13): decision, minimum, publicBalance, amount,
+Retry semantics: the platform uses `task_id` as an idempotency key and may redeliver
+the same task after a network failure. A redelivery must return the SAME answer, not a
+replay rejection — so responses are cached by task_id, and the replay guard only fires
+when a `proof_tx` shows up under a DIFFERENT task_id.
+
+Circuit (GatekeeperEvaluation) inputs: decision, minimum, publicBalance, amount,
 maxTransfer, expiryBlock, currentBlock, recipient, conditionRecipient,
-registeredVkHash, proofVkHash, taskId, salt(private). The circuit constrains
-`decision` to equal the conjunction of the payment conditions, so a proof is
-attached only when our decision matches that conjunction; rejects for
-replay/staleness have no circuit counterpart and are returned bare.
-
-Proofs are produced with the snarkjs CLI (`wtns calculate` then `groth16 prove`),
-which is ~1s end-to-end; the JS API path hangs in this environment.
+registeredVkHash, proofVkHash, taskId, salt(private). It constrains `decision` to equal
+the conjunction of the payment conditions, so rejects for replay/staleness (which have no
+circuit counterpart) are returned without a proof.
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Request, Response
 
-app = FastAPI(title="agent-games-gatekeeper", version="1.3.0")
+app = FastAPI(title="agent-games-gatekeeper", version="1.4.0")
 APP = app
 
 HMAC_SECRET = (os.environ.get("AGENT_GAMES_HMAC_SECRET")
@@ -51,8 +49,10 @@ PROTOCOL_VERSION = "v1"
 
 P = 21888242871839275222246405745257275088548364400416034343698204186575808495617
 
-_SEEN_PROOF_TX: Dict[str, float] = {}
+_SEEN_PROOF_TX: Dict[str, Tuple[str, float]] = {}   # proof_tx -> (task_id, ts)
+_RESPONSE_CACHE: Dict[str, Tuple[Dict[str, Any], float]] = {}  # task_id -> (response, ts)
 _REPLAY_TTL = 86_400
+_CACHE_TTL = 3_600
 
 
 def _sign(body: bytes) -> str:
@@ -82,15 +82,36 @@ def _signature_ok(raw: bytes, header: str) -> bool:
     return ok
 
 
-def _seen_proof_tx(reference: str) -> bool:
+def _cache_get(task_id: str) -> Optional[Dict[str, Any]]:
+    entry = _RESPONSE_CACHE.get(task_id)
+    if not entry:
+        return None
+    payload, ts = entry
+    if time.time() - ts > _CACHE_TTL:
+        _RESPONSE_CACHE.pop(task_id, None)
+        return None
+    return payload
+
+
+def _cache_put(task_id: str, payload: Dict[str, Any]) -> None:
     now = time.time()
-    for key, ts in list(_SEEN_PROOF_TX.items()):
+    for key, (_, ts) in list(_RESPONSE_CACHE.items()):
+        if now - ts > _CACHE_TTL:
+            _RESPONSE_CACHE.pop(key, None)
+    _RESPONSE_CACHE[task_id] = (payload, now)
+
+
+def _proof_tx_state(reference: str, task_id: str) -> str:
+    """'fresh', 'retry' (same task) or 'reused' (different task)."""
+    now = time.time()
+    for key, (_, ts) in list(_SEEN_PROOF_TX.items()):
         if now - ts > _REPLAY_TTL:
             _SEEN_PROOF_TX.pop(key, None)
-    if reference in _SEEN_PROOF_TX:
-        return True
-    _SEEN_PROOF_TX[reference] = now
-    return False
+    seen = _SEEN_PROOF_TX.get(reference)
+    if seen is None:
+        _SEEN_PROOF_TX[reference] = (task_id, now)
+        return "fresh"
+    return "retry" if seen[0] == task_id else "reused"
 
 
 def _to_int(value: Any) -> Optional[int]:
@@ -114,7 +135,6 @@ def _parse_iso(value: Any) -> Optional[float]:
 
 
 def _field(value: Any) -> str:
-    """Map a decimal/hex value into the BN254 scalar field."""
     text = str(value if value is not None else "0").strip()
     try:
         number = int(text, 16) if text.lower().startswith("0x") else int(text or "0")
@@ -128,7 +148,6 @@ def _hash_field(text: str) -> str:
 
 
 def circuit_verdict(data: Dict[str, Any]) -> Tuple[bool, str]:
-    """The five conditions the circuit actually constrains, in check order."""
     registered_vk = _norm(data.get("registered_vk"))
     proof_vk = _norm(data.get("proof_vk"))
     if not registered_vk or not proof_vk or registered_vk != proof_vk:
@@ -180,7 +199,6 @@ def circuit_inputs(data: Dict[str, Any], decision: bool, task_id: str) -> Dict[s
 
 
 def prove(data: Dict[str, Any], decision: bool, task_id: str) -> Optional[Dict[str, Any]]:
-    """Generate a Groth16 proof with the snarkjs CLI. Returns None on any failure."""
     if not PROVE_ENABLED:
         return None
     if not (os.path.exists(SNARKJS) and os.path.exists(WASM) and os.path.exists(ZKEY)):
@@ -220,6 +238,11 @@ def decide(task: Dict[str, Any]) -> Dict[str, Any]:
     data = task.get("input") or {}
     task_id = str(task.get("task_id") or "")
 
+    cached = _cache_get(task_id) if task_id else None
+    if cached is not None:
+        print(f"retry: cached response for {task_id}", flush=True)
+        return cached
+
     issued = _parse_iso(task.get("issued_at"))
     if issued is not None and abs(time.time() - issued) > CLOCK_SKEW_SECONDS:
         return {"decision": "REJECT", "reason_code": "STALE_TASK"}
@@ -227,8 +250,9 @@ def decide(task: Dict[str, Any]) -> Dict[str, Any]:
     proof_tx = data.get("proof_tx") or task.get("proof_tx")
     if not proof_tx:
         return {"decision": "REJECT", "reason_code": "MISSING_PROOF_TX"}
-    if _seen_proof_tx(str(proof_tx).lower()):
-        # Reused proof is rejected outside the circuit, so no proof is attached.
+
+    state = _proof_tx_state(str(proof_tx).lower(), task_id)
+    if state == "reused":
         return {"decision": "REJECT", "reason_code": "REPLAYED_PROOF", "proof_tx": proof_tx}
 
     approved, reason = circuit_verdict(data)
@@ -240,6 +264,8 @@ def decide(task: Dict[str, Any]) -> Dict[str, Any]:
     evidence = prove(data, approved, task_id)
     if evidence:
         verdict.update(evidence)
+    if task_id:
+        _cache_put(task_id, verdict)
     return verdict
 
 
@@ -247,7 +273,8 @@ def decide(task: Dict[str, Any]) -> Dict[str, Any]:
 def health() -> Dict[str, Any]:
     return {"status": "ok", "protocolVersion": PROTOCOL_VERSION,
             "hmacConfigured": bool(HMAC_SECRET),
-            "proverEnabled": PROVE_ENABLED and os.path.exists(SNARKJS)}
+            "proverEnabled": PROVE_ENABLED and os.path.exists(SNARKJS),
+            "cachedTasks": len(_RESPONSE_CACHE)}
 
 
 @app.post("/agent")

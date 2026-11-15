@@ -26,7 +26,7 @@ def iso(delta=0):
 def task(unique="1", **over):
     body = {
         "type": "agent-games.proof-gatekeeper.v1",
-        "task_id": f"gk_test_{unique}",
+        "task_id": f"gk_test_{unique}_{int(time.time() * 1000)}",
         "mode": "competition",
         "issued_at": iso(),
         "deadline_at": iso(60),
@@ -106,6 +106,11 @@ def main():
     t7 = task("7")
     post(t7)
     st, body, sig = post(t7)
+    rows.append(("redelivery same verdict", body.get("decision") == "APPROVE", body, sig))
+
+    t7b = task("7b")
+    t7b["input"]["proof_tx"] = t7["input"]["proof_tx"]
+    st, body, sig = post(t7b)
     rows.append(("reject replay (no proof)", body.get("reason_code") == "REPLAYED_PROOF" and "proof" not in body, body, sig))
 
     st, body, sig = post(task("8", issued_at=iso(-3600)))
