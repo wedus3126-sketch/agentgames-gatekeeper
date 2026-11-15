@@ -1,89 +1,106 @@
-# Agent Games — Proof Gatekeeper agent (protocol v1)
+# Agent Games — Proof Gatekeeper agent (protocol v1, with Groth16 proofs)
 
 Deterministic gatekeeper agent for the zkVerify **Agent Games** Proof Gatekeeper event.
-The platform POSTs HMAC-signed task envelopes; this agent decides `APPROVE` / `REJECT`
-and signs its answer.
+The platform POSTs HMAC-signed task envelopes; this agent decides `APPROVE` / `REJECT`,
+proves the decision with the official Groth16 circuit, and signs its answer.
 
-Spec followed: <https://agentgames.zkverify.io/build>
+Spec: <https://agentgames.zkverify.io/build>
 
 ## Contract
 
-`POST /agent` — signed JSON, `x-agent-games-signature: <lowercase hex hmac-sha256>` over the
-**raw** request body, using `AGENT_GAMES_HMAC_SECRET` (issued once by the dashboard's
-*Rotate Secret*). Every response carries the same header, computed over the raw response body.
+`POST /agent` — signed JSON. `x-agent-games-signature` carries the **lowercase hex**
+HMAC-SHA256 of the raw body (the platform sends it without a `sha256=` prefix; responses
+use the same format). Secret: `AGENT_GAMES_HMAC_SECRET`, issued once by *Rotate Secret*.
 
-`GET /health` — liveness probe.
+`GET /health` — liveness plus `proverEnabled`.
 
-### Preflight handshake
+### Preflight
 
 ```
 in : {"type":"agent-games.preflight.v1","agent_id":"agt_...","issued_at":"...","nonce":"..."}
-out: {"ok":true,"protocolVersion":"v1"}          # signed
+out: {"ok":true,"protocolVersion":"v1"}      # signed
 ```
 
-Preflight must pass before the platform marks the agent active.
-
-### Task envelope (Proof Gatekeeper)
+### Task → response
 
 ```
-{"type":"agent-games.proof-gatekeeper.v1","task_id":"gk_...","mode":"competition",
- "issued_at":"...","deadline_at":"...",
- "input":{"registered_vk":"0x..","proof_vk":"0x..","minimum":"1000","public_balance":"1460",
-          "expiry_block":8430000,"current_block":8420000,"recipient":"0x..",
-          "condition_recipient":"0x..","amount":"500","max_transfer":"1000","proof_tx":"0x.."}}
-```
-
-### Response
-
-```
-{"decision":"APPROVE","reason_code":"VALID_CONDITION","proof_tx":"0x.."}
+in : {"type":"agent-games.proof-gatekeeper.v1","task_id":"gk_...","issued_at":"...",
+      "input":{"registered_vk","proof_vk","minimum","public_balance","expiry_block",
+               "current_block","recipient","condition_recipient","amount",
+               "max_transfer","proof_tx"}}
+out: {"decision","reason_code","proof_tx","proof","public_signals","task_id"}
 ```
 
 ## Decision rules (deterministic, fail-closed)
 
-Checks run in order; the first failure wins and the answer is `REJECT`.
+Order matters; the first failure wins.
 
-| # | Check | reason_code |
-|---|---|---|
-| 1 | inbound HMAC matches raw body | `401 invalid_signature` |
-| 2 | `issued_at` within `AGENT_CLOCK_SKEW` (default 180s) | `STALE_TASK` |
-| 3 | `registered_vk == proof_vk` | `VK_SUBSTITUTION` |
-| 4 | `current_block < expiry_block` | `EXPIRED_CONDITION` |
-| 5 | `public_balance >= minimum` | `THRESHOLD_MISMATCH` |
-| 6 | `recipient == condition_recipient` | `RECIPIENT_MISMATCH` |
-| 7 | `0 < amount <= max_transfer` | `INVALID_AMOUNT`, `AMOUNT_EXCEEDS_MAX` |
-| 8 | `amount <= public_balance` | `INSUFFICIENT_BALANCE` |
-| 9 | `proof_tx` present and never seen before | `MISSING_PROOF_TX`, `REPLAYED_PROOF` |
-| 10 | all of the above | `APPROVE` / `VALID_CONDITION` |
+| # | Check | reason_code | proof |
+|---|---|---|---|
+| 1 | inbound HMAC over raw body | `401 invalid_signature` | — |
+| 2 | `issued_at` within `AGENT_CLOCK_SKEW` (180s) | `STALE_TASK` | no |
+| 3 | `proof_tx` present | `MISSING_PROOF_TX` | no |
+| 4 | `proof_tx` never seen before | `REPLAYED_PROOF` | no |
+| 5 | `registered_vk == proof_vk` | `VK_SUBSTITUTION` | yes |
+| 6 | `public_balance >= minimum` | `THRESHOLD_MISMATCH` | yes |
+| 7 | `current_block < expiry_block` | `EXPIRED_CONDITION` | yes |
+| 8 | `recipient == condition_recipient` | `RECIPIENT_MISMATCH` | yes |
+| 9 | `0 < amount <= max_transfer` | `INVALID_AMOUNT`, `AMOUNT_EXCEEDS_MAX` | yes |
+| 10 | all of the above | `APPROVE` / `VALID_CONDITION` | yes |
 
-Any timeout or ambiguity rejects — the agent never approves by default.
+Replay and staleness are rejected *outside* the circuit, so those responses carry no proof —
+the circuit constrains `decision` to equal the conjunction of the payment conditions and
+would reject a witness that approves a replay.
+
+## Groth16 proofs
+
+The published circuit is `GatekeeperEvaluation` (Circom 2.x, Groth16/BN254). Its input
+signals are not documented; they were recovered by probing the published WASM
+(`tools/probe_sizes.js`) — `getInputSignalSize` returns ≥ 1 only for real inputs:
+
+| signal | source |
+|---|---|
+| `decision` | 1 = approve, 0 = reject |
+| `minimum`, `publicBalance`, `amount`, `maxTransfer` | task input, decimal → field element |
+| `expiryBlock`, `currentBlock` | task input |
+| `recipient`, `conditionRecipient` | 20-byte address → integer mod p |
+| `registeredVkHash`, `proofVkHash` | 32-byte vk hash → integer mod p |
+| `taskId` | `sha256("taskId:" + task_id) mod p` |
+| `salt` (private) | `HMAC(secret, "gatekeeper-salt:" + task_id) mod p` |
+
+`salt` and `taskId` are derived deterministically, so a redelivered task reproduces the
+same witness instead of a fresh one.
+
+Proving runs through the **snarkjs CLI** (`wtns calculate` → `groth16 prove`); the JS API
+path stalls in this environment. Measured: ~0.25s witness, ~0.55s prove, ~2.6–3.2s
+round-trip end to end on a t3.micro, well inside the 60s deadline.
 
 ## Run
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
+npm install                      # snarkjs
+curl -O https://agentgames.zkverify.io/circuits/gatekeeper.wasm
+curl -O https://agentgames.zkverify.io/circuits/gatekeeper_final.zkey
 export AGENT_GAMES_HMAC_SECRET='<from Rotate Secret>'
+export GK_WASM=$PWD/gatekeeper.wasm GK_ZKEY=$PWD/gatekeeper_final.zkey
+export AGENT_SNARKJS=$PWD/node_modules/.bin/snarkjs
 uvicorn agent:app --host 0.0.0.0 --port 8080
 ```
 
-Deployment used in this entry: Amazon Linux 2023 EC2 (ap-southeast-2), systemd unit
-`agentgames-gatekeeper` on `127.0.0.1:8080`, Caddy terminating TLS in front of it.
+Deployed entry: Amazon Linux 2023 EC2 (ap-southeast-2), systemd unit
+`agentgames-gatekeeper` on `127.0.0.1:8080`, Caddy terminating TLS in front.
 
 ## Tests
 
 ```bash
-AGENT_GAMES_HMAC_SECRET=test-secret .venv/bin/python tests/test_protocol_v1.py
+# decision paths, each proof re-verified with snarkjs against the extracted vk
+AGENT_GAMES_HMAC_SECRET=test-secret .venv/bin/python tests/test_with_proofs.py
 ```
 
-Covers preflight, a valid approval, and each rejection path (VK substitution, threshold,
-recipient, expiry, amount cap, stale task, bad signature). All responses are verified signed.
-
-## Not yet implemented
-
-Groth16 proof generation (`snarkjs` + `gatekeeper.wasm` / `gatekeeper_final.zkey`) and Kurier
-submission. The spec deducts −2 when a provable task returns no valid proof; decisions are
-still scored independently.
+Covers preflight, approve, every trap class, replay, stale task and a tampered signature,
+and asserts every attached proof verifies.
 
 ## Circuit reference (zkVerify mainnet)
 
@@ -94,5 +111,5 @@ still scored independently.
 
 ## Secrets
 
-Never commit `.env`; only `.env.example` ships. A placeholder secret makes preflight fail
+`.env` is git-ignored; only `.env.example` ships. A placeholder secret fails preflight
 with a signature error.

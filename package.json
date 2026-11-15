@@ -1,0 +1,25 @@
+{
+  "name": "gatekeeper-agent",
+  "version": "1.0.0",
+  "description": "Deterministic gatekeeper agent for the zkVerify **Agent Games** Proof Gatekeeper event. The platform POSTs HMAC-signed task envelopes; this agent decides `APPROVE` / `REJECT` and signs its answer.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wedus3126-sketch/agentgames-gatekeeper.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/wedus3126-sketch/agentgames-gatekeeper/issues"
+  },
+  "homepage": "https://github.com/wedus3126-sketch/agentgames-gatekeeper#readme",
+  "dependencies": {
+    "snarkjs": "^0.7.6"
+  }
+}
